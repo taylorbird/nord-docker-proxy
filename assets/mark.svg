@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- "Line cube": isometric cube whose inner Y is the route — one line in, two out.
+       Palette: --icon-bg #0C1A2B, --mark #E9EEF5, --accent #3BD48A.
+       Source of truth for scripts/render-icon.swift (which draws the same geometry). -->
+  <rect width="24" height="24" fill="#0C1A2B"/>
+  <g transform="translate(2.4 2.4) scale(0.8)" fill="none" stroke-linecap="butt" stroke-linejoin="miter">
+    <path d="M12 5L18.06 8.5L18.06 15.5L12 19L5.94 15.5L5.94 8.5Z" stroke="#E9EEF5" stroke-width="0.95"/>
+    <path d="M12 22.6V19L12 12L5.94 8.5L2.9 6.75M12 12L18.06 8.5L21.1 6.75" stroke="#3BD48A" stroke-width="1.1"/>
+  </g>
+</svg>

@@ -29,6 +29,18 @@ APP="$REPO/build/Nord Docker Proxy.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/nord-docker-proxy/bin"
 cp "$BIN" "$APP/Contents/MacOS/NordDockerProxy"
+
+# Icon: actool compiles the Icon Composer package (layers from
+# scripts/render-icon.swift) into Assets.car for Liquid Glass (macOS 26+),
+# plus an AppIcon.icns fallback (up to 256px) for older macOS.
+mkdir -p "$REPO/build"
+xcrun actool "$REPO/assets/icon/AppIcon.icon" \
+  --compile "$APP/Contents/Resources" \
+  --app-icon AppIcon --include-all-app-icons \
+  --enable-on-demand-resources NO --development-region en \
+  --target-device mac --platform macosx --minimum-deployment-target 14.0 \
+  --output-partial-info-plist "$REPO/build/actool-partial.plist" \
+  --output-format human-readable-text >/dev/null
 cp "$REPO/bin/nord-docker-proxy" "$APP/Contents/Resources/nord-docker-proxy/bin/"
 cp "$REPO/compose.yaml" "$APP/Contents/Resources/nord-docker-proxy/"
 ditto "$REPO/docker" "$APP/Contents/Resources/nord-docker-proxy/docker"
@@ -42,6 +54,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>com.tbird.norddockerproxy</string>
   <key>CFBundleExecutable</key><string>NordDockerProxy</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
