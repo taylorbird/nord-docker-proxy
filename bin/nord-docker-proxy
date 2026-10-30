@@ -1,18 +1,19 @@
 #!/bin/zsh -f
 # nord-docker-proxy — the NordLayer VPN in a Docker container, exposed to this
-# Mac only as a password-protected SOCKS5 proxy on 127.0.0.1. Only traffic sent
-# to the proxy rides the VPN, and only to the ports you allow; the Mac itself
-# stays off the VPN. `down` severs the link entirely.
+# Mac only as local proxies: SOCKS5 on 127.0.0.1:1080 and HTTP on
+# 127.0.0.1:8080. Whatever you point at them reaches what the VPN reaches; the
+# Mac itself stays off the VPN. `down` severs the link entirely.
 #
-#   nord-docker-proxy setup               first-run: org, ports, login, gateway
+#   nord-docker-proxy setup               first-run: org, login, gateway
 #   nord-docker-proxy up [--hours N]      start; connect if logged in; optional auto-stop
 #   nord-docker-proxy down                stop and remove the container (login is kept)
 #   nord-docker-proxy connect             connect the VPN to the configured gateway
 #   nord-docker-proxy disconnect          drop the VPN, leave the container running
 #   nord-docker-proxy login               log in (SSO); finishes itself from the clipboard
 #   nord-docker-proxy logout              end the session and delete the saved login
-#   nord-docker-proxy status [--json]     container / login / VPN exit / firewall / proxy
-#   nord-docker-proxy proxy-env           `export` lines for scripts: eval "$(nord-docker-proxy proxy-env)"
+#   nord-docker-proxy status [--json]     container / login / VPN exit / proxies
+#   nord-docker-proxy proxy-env           `export` lines: eval "$(nord-docker-proxy proxy-env)"
+#   nord-docker-proxy chrome              open a separate Chrome profile through the VPN
 #   nord-docker-proxy gateways            list the gateways your account can use
 #   nord-docker-proxy rebuild             rebuild the image (after updating the pinned package)
 #   nord-docker-proxy logs                follow the container's logs
@@ -29,8 +30,6 @@ CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/$NAME
 CONFIG=$CONFIG_DIR/config.env
 CONTAINER=$NAME
 IMAGE=$NAME
-PROXY_USER=$NAME
-KEYCHAIN_SERVICE=$NAME
 LOGIN_TIMEOUT=300
 
 die() { print -u2 -r -- "$NAME: $*"; exit 1 }
@@ -46,8 +45,8 @@ load_config() {
 }
 load_config
 STATE_VOLUME=${NDP_STATE_VOLUME:-$NAME-state}
-PROXY_PORT=${NDP_PROXY_PORT:-1080}
-PROXY=127.0.0.1:$PROXY_PORT
+SOCKS=127.0.0.1:${NDP_PROXY_PORT:-1080}
+HTTP=127.0.0.1:${NDP_HTTP_PORT:-8080}
 
 set_config() {   # set_config KEY value — add or replace one line
   mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
@@ -60,26 +59,13 @@ set_config() {   # set_config KEY value — add or replace one line
 }
 
 require_config() {
-  [[ -n "${NDP_ORG:-}" && -n "${NDP_ALLOWED_PORTS:-}" ]] || die "not set up yet; run: $NAME setup"
+  [[ -n "${NDP_ORG:-}" ]] || die "not set up yet; run: $NAME setup"
 }
 
-# The proxy password lives in the login Keychain, generated on first use. It
-# is never printed except by `proxy-env`, which exists to be eval'd.
-proxy_pass() {
-  local p
-  p=$(security find-generic-password -s $KEYCHAIN_SERVICE -a $PROXY_USER -w 2>/dev/null)
-  if [[ -z "$p" ]]; then
-    p=$(openssl rand -hex 24)
-    security add-generic-password -s $KEYCHAIN_SERVICE -a $PROXY_USER -w "$p" \
-      -D "$NAME SOCKS proxy password" >/dev/null || die "could not store the proxy password in Keychain"
-  fi
-  print -r -- "$p"
-}
-
-# Every compose call gets the config file plus the Keychain-held credentials.
+# Every compose call gets the config file.
 compose() {
   local envfile=(); [[ -f "$CONFIG" ]] && envfile=(--env-file "$CONFIG")
-  NDP_PROXY_USER=$PROXY_USER NDP_PROXY_PASS=$(proxy_pass) NDP_MAX_HOURS=${NDP_MAX_HOURS:-0} \
+  NDP_MAX_HOURS=${NDP_MAX_HOURS:-0} \
     docker compose --progress quiet -p $NAME $envfile -f "$ROOT/compose.yaml" "$@"
 }
 running() { [[ "$(docker inspect -f '{{.State.Running}}' $CONTAINER 2>/dev/null)" == true ]] }
@@ -127,12 +113,17 @@ cmd_up() {
 cmd_down() {
   compose down >/dev/null 2>&1
   running && die "container is still running"
-  print "Down. The proxy is gone; nothing reaches the VPN."
+  print "Down. The proxies are gone; nothing reaches the VPN."
 }
 
 cmd_connect() {
   running || die "not running; run '$NAME up'"
   [[ -n "${NDP_GATEWAY:-}" ]] || die "no gateway configured; run '$NAME setup' or set NDP_GATEWAY"
+  # NordLayer's own kill switch drops every inbound connection on the
+  # container's interface — the path the Mac uses to reach the proxies. It's
+  # stored in NordLayer's database, so a fresh login can bring it back; the
+  # proxies' own VPN-only rule (entrypoint.sh) replaces it.
+  nl --assume-yes settings set killswitch off >/dev/null 2>&1
   nl connect "$NDP_GATEWAY" >/dev/null || die "connect failed; see '$NAME status'"
   print "Connected to gateway $NDP_GATEWAY."
 }
@@ -162,11 +153,27 @@ cmd_rebuild() {
   print "Rebuilt. Run '$NAME down' then '$NAME up' to use it."
 }
 
+# For `eval`: the conventional proxy variables most tools honor (HTTP proxy for
+# http/https, SOCKS for everything else), plus NDP_* for code that wants them
+# explicitly (e.g. a database driver's proxyHost/proxyPort).
 cmd_proxy_env() {
-  local pass; pass=$(proxy_pass)
-  print -r -- "export NDP_PROXY_HOST=127.0.0.1 NDP_PROXY_PORT=$PROXY_PORT"
-  print -r -- "export NDP_PROXY_USER=$PROXY_USER NDP_PROXY_PASS=$pass"
-  print -r -- "export NDP_PROXY_URL=socks5h://$PROXY_USER:$pass@$PROXY"
+  print -r -- "export HTTP_PROXY=http://$HTTP HTTPS_PROXY=http://$HTTP http_proxy=http://$HTTP https_proxy=http://$HTTP"
+  print -r -- "export ALL_PROXY=socks5h://$SOCKS all_proxy=socks5h://$SOCKS"
+  print -r -- "export NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1"
+  print -r -- "export NDP_PROXY_HOST=127.0.0.1 NDP_PROXY_PORT=${SOCKS##*:} NDP_HTTP_PORT=${HTTP##*:}"
+  print -r -- "export NDP_SOCKS_URL=socks5h://$SOCKS NDP_HTTP_URL=http://$HTTP"
+}
+
+# A separate Chrome profile (its own window, history and cookies) whose traffic
+# all goes through the VPN; your everyday Chrome is untouched. Chrome only
+# honors --proxy-server when it starts that profile, hence the dedicated
+# --user-data-dir.
+cmd_chrome() {
+  running || die "not running; run '$NAME up'"
+  open -na "Google Chrome" --args --user-data-dir="$CONFIG_DIR/chrome" \
+    --proxy-server="http://$HTTP" --no-first-run --no-default-browser-check \
+    || die "could not open Google Chrome"
+  print "Opened Chrome (VPN profile) through http://$HTTP."
 }
 
 # `nordlayer gateways` prints a table whose IDs contain zero-width spaces;
@@ -194,13 +201,6 @@ cmd_setup() {
   [[ -n "$answer" ]] && set_config NDP_ORG "$answer"
   [[ -n "${NDP_ORG:-}" ]] || die "an organization ID is required"
 
-  print "\nWhich destination ports may the proxy reach through the VPN?"
-  print "Comma-separated (e.g. 27017 for MongoDB, 5432 for Postgres), or 'any'."
-  read "answer?Allowed ports [${NDP_ALLOWED_PORTS:-}]: "
-  [[ -n "$answer" ]] && set_config NDP_ALLOWED_PORTS "$answer"
-  [[ "${NDP_ALLOWED_PORTS:-}" == any || "${NDP_ALLOWED_PORTS:-}" =~ '^[0-9]+(,[0-9]+)*$' ]] \
-    || die "allowed ports must look like 27017 or 5432,6379 or any"
-
   read "answer?Only accept this NordLayer login email (optional) [${NDP_ACCOUNT:-}]: "
   [[ -n "$answer" ]] && set_config NDP_ACCOUNT "$answer"
 
@@ -220,7 +220,7 @@ cmd_setup() {
   set_config NDP_GATEWAY "${rows[$answer]%%$'\t'*}"
 
   cmd_connect
-  print "\nDone. '$NAME status' to check; '$NAME down' to stop."
+  print "\nDone. '$NAME status' to check; '$NAME chrome' for a browser on the VPN; '$NAME down' to stop."
 }
 
 # NordLayer's SSO ends by sending the browser to nordlayer://auth?exchange_token=…
@@ -251,27 +251,25 @@ cmd_login_inner() {
   require_config
   print "step: opening sign-in in the browser"
   print "step: on the success page, right-click \"Continue\" → Copy Link"
-  {
-    local deadline=$(( SECONDS + LOGIN_TIMEOUT )) clip
-    while (( SECONDS < deadline )); do
-      clip=$(pbpaste 2>/dev/null)
-      if [[ "$clip" == nordlayer://auth\?exchange_token=* ]]; then
-        # Handed over on stdin, never as an argument on this Mac, so the token
-        # never shows in the Mac-wide process list.
-        print -r -- "$clip" | docker exec -i -u nordlayer $CONTAINER \
-          sh -c 'nordlayer --silent click "$(cat)"' >/dev/null 2>&1
-        pbcopy </dev/null
-        exit 0
-      fi
-      sleep 1
-    done
-  } &!
-  local watcher=$!
-  # The watcher is disowned so it survives the expect session; it must not
-  # survive us. Ctrl-C, an error, or normal exit all stop it.
-  trap "kill $watcher 2>/dev/null" EXIT INT TERM
-  NDP_C=$CONTAINER NDP_O=$NDP_ORG NDP_T=$LOGIN_TIMEOUT expect -f - <<'EXPECT'
+  # A login stopped on this Mac (Ctrl-C, a killed app) leaves its `nordlayer
+  # login` running inside the container, and a copied link can then land on
+  # that stale session. Exactly one login session at a time.
+  docker exec $CONTAINER pkill -f "nordlayer login" >/dev/null 2>&1
+  # One process does it all: expect drives the login prompt and, while it
+  # waits, checks the clipboard once a second. (A separate background watcher
+  # can be killed on its own — e.g. when a caller backgrounds this command —
+  # leaving the login waiting forever.)
+  #
+  # The script reaches expect on fd 3, not stdin, so stdin stays the terminal:
+  # if NordLayer asks for a 2FA code, the prompt is handed to the person.
+  # Without a terminal (the menu bar app) a 2FA prompt ends the login with a
+  # step telling them to run it in Terminal.
+  local tty=0; [[ -t 0 ]] && tty=1
+  NDP_C=$CONTAINER NDP_O=$NDP_ORG NDP_T=$LOGIN_TIMEOUT NDP_TTY=$tty expect -f /dev/fd/3 3<<'EXPECT'
 log_user 0
+# NordLayer's own refusals ("Could not log in: Portal visit delayed by 32s"
+# when it's throttling attempts) end the login with its message.
+proc refused {msg} { puts "step: NordLayer: [string trim $msg]"; exit 1 }
 set timeout 30
 spawn docker exec -it -u nordlayer $env(NDP_C) nordlayer login -o $env(NDP_O)
 # Prefer an SSO method in this order; email/password needs typing, so it's
@@ -291,6 +289,7 @@ expect {
     send "$choice\r"
   }
   -re {already logged in} { exit 0 }
+  -re {Could not log in: ([^\r\n]+)} { refused $expect_out(1,string) }
   timeout { puts "step: NordLayer did not prompt for a login method"; exit 1 }
   eof     { puts "step: login ended unexpectedly"; exit 1 }
 }
@@ -299,15 +298,57 @@ expect {
     exec open $expect_out(1,string)
     puts "step: waiting for the copied Continue link"
   }
+  -re {Could not log in: ([^\r\n]+)} { refused $expect_out(1,string) }
   timeout { puts "step: no sign-in link was printed"; exit 1 }
 }
-set timeout $env(NDP_T)
-expect {
-  eof     { exit 0 }
-  timeout { puts "step: timed out waiting for sign-in"; exit 1 }
+# Wait for the login to finish, checking the clipboard every second for the
+# copied Continue link. The link goes to the container's `nordlayer click`
+# (what Linux's own URL handler runs) on stdin (Tcl's `<<`), never as an
+# argument on this Mac, so the token never shows in the process list; then
+# the clipboard is cleared.
+#
+# Only a link copied AFTER this point counts: whatever is already on the
+# clipboard (e.g. a stale link from an earlier attempt) is ignored, and copying
+# a newer link hands that one over too.
+set deadline [expr {[clock seconds] + $env(NDP_T)}]
+set timeout 1
+if {[catch {exec pbpaste} last]} { set last "" }
+while {1} {
+  expect {
+    eof { exit 0 }
+    -re {Could not log in: ([^\r\n]+)} { refused $expect_out(1,string) }
+    -re {Available 2FA methods} {
+      # A new device (or the org's policy) asks for a second factor: pick the
+      # authenticator app when offered, then hand the code prompt to the person.
+      if {!$env(NDP_TTY)} {
+        puts "step: NordLayer asks for a 2FA code — run 'nord-docker-proxy login' in Terminal"
+        exit 1
+      }
+      set timeout 15
+      set tfa ""
+      expect {
+        -re {(\d+): Authenticator app} { set tfa $expect_out(1,string); exp_continue }
+        -re {(\d+): [^\r\n]+} { if {$tfa eq ""} { set tfa $expect_out(1,string) }; exp_continue }
+        -re {Select \[number\]:} { send "$tfa\r" }
+        timeout { puts "step: NordLayer's 2FA prompt didn't finish"; exit 1 }
+      }
+      puts "step: enter the code from your authenticator app, then press Return"
+      log_user 1
+      interact
+      exit 0
+    }
+    timeout {
+      if {[clock seconds] > $deadline} { puts "step: timed out waiting for sign-in"; exit 1 }
+      if {![catch {exec pbpaste} clip] && $clip ne $last && [string match {nordlayer://auth[?]exchange_token=*} $clip]} {
+        set last $clip
+        catch {exec docker exec -i -u nordlayer $env(NDP_C) sh -c {nordlayer click "$(cat)"} << $clip}
+        catch {exec pbcopy < /dev/null}
+        puts "step: got the link, finishing sign-in"
+      }
+    }
+  }
 }
 EXPECT
-  kill $watcher 2>/dev/null
   logged_in_now || die "login did not complete"
   verify_account
   print "step: logged in"
@@ -315,7 +356,7 @@ EXPECT
 
 # Anything that can write the clipboard during the login window could hand
 # over its OWN exchange token, logging the container into someone else's
-# NordLayer org — and routing the proxy through their gateway. So the account
+# NordLayer org — and routing the proxies through their gateway. So the account
 # that logged in must be in the configured org (and be NDP_ACCOUNT, when set);
 # otherwise log straight back out and delete the saved login.
 verify_account() {
@@ -330,33 +371,32 @@ verify_account() {
 }
 
 # One snapshot of every layer.
-#  - firewall: the proxy's VPN-only / allowed-ports rules are loaded.
-#  - exit IP: probed from inside the container as root (the proxy itself may
-#    not reach port 443), via the same routing the proxy's traffic uses.
-#  - proxy: an authenticated SOCKS handshake from the Mac succeeds. The target
-#    is the container's own closed port, so the handshake completes and the
-#    connect is refused: "refused" proves auth worked, "rejected" means the
-#    password is wrong, anything else means the proxy isn't answering.
+#  - firewall: the proxies' tunnel-only rule is loaded.
+#  - exit IP: fetched THROUGH the SOCKS proxy from the Mac, so it proves the
+#    whole path — proxy answering, traffic leaving at the VPN gateway. With the
+#    VPN down the kill switch blocks it and there is no exit IP.
+#  - each proxy: answering at all. The target is the container's own closed
+#    port, so a reply (an error from the proxy) proves the proxy is listening
+#    without depending on the VPN.
 collect() {
-  configured=false; [[ -n "${NDP_ORG:-}" && -n "${NDP_ALLOWED_PORTS:-}" ]] && configured=true
-  container=down login="" vpn="" gateway="" server="" firewall=false proxy=down exit_ip=""
+  configured=false; [[ -n "${NDP_ORG:-}" ]] && configured=true
+  container=down login="" vpn="" gateway="" server="" firewall=false socks=down http=down exit_ip=""
   if running; then
     container=up
-    local s err
+    local s err code
     s=$(nl status 2>/dev/null)
     login=$(field "$s" Login); vpn=$(field "$s" VPN)
     gateway=$(field "$s" Gateway); server=$(field "$s" "Server address")
     docker exec $CONTAINER nft list table inet proxy_firewall >/dev/null 2>&1 && firewall=true
-    exit_ip=$(docker exec $CONTAINER curl -s -m 6 https://api.ipify.org 2>/dev/null)
-    err=$(curl -sS -m 6 --proxy "socks5h://$PROXY_USER:$(proxy_pass)@$PROXY" telnet://127.0.0.1:9 </dev/null 2>&1 >/dev/null)
-    case "$err" in
-      *"Can't complete SOCKS5 connection"*|*"Connection refused"*|"") proxy=up ;;
-      *rejected*|*"authentication"*|*"acceptable"*) proxy=auth-failed ;;
-    esac
+    exit_ip=$(curl -s -m 6 --proxy "socks5h://$SOCKS" https://api.ipify.org 2>/dev/null)
+    err=$(curl -sS -m 6 --proxy "socks5h://$SOCKS" telnet://127.0.0.1:9 </dev/null 2>&1 >/dev/null)
+    [[ -n "$exit_ip" || "$err" == *"Can't complete SOCKS5 connection"* ]] && socks=up
+    code=$(curl -s -m 6 -o /dev/null -w '%{http_code}' --proxy "http://$HTTP" http://127.0.0.1:9/ 2>/dev/null)
+    [[ -n "$code" && "$code" != 000 ]] && http=up
   fi
   logged_in=false; [[ "$login" == "Logged in"* ]] && logged_in=true
   connected=false; [[ "$vpn" == Connected ]] && connected=true
-  # Through the VPN only when the container exits at the gateway's address.
+  # Through the VPN only when the proxy's traffic exits at the gateway's address.
   via_vpn=false; [[ -n "$exit_ip" && "$exit_ip" == "$server" ]] && via_vpn=true
 }
 
@@ -365,11 +405,11 @@ cmd_status() {
   if [[ "${1:-}" == --json ]]; then
     jq -n --argjson configured $configured --arg container "$container" --argjson loggedIn $logged_in \
       --arg login "$login" --argjson connected $connected --arg gateway "$gateway" --arg server "$server" \
-      --argjson firewall $firewall --arg proxy "$proxy" --arg exitIp "$exit_ip" \
-      --argjson viaVpn $via_vpn --arg proxyAddr $PROXY --arg allowedPorts "${NDP_ALLOWED_PORTS:-}" \
+      --argjson firewall $firewall --arg socks "$socks" --arg http "$http" --arg exitIp "$exit_ip" \
+      --argjson viaVpn $via_vpn --arg socksAddr $SOCKS --arg httpAddr $HTTP \
       '{configured: $configured, container: $container, loggedIn: $loggedIn, login: $login,
         connected: $connected, gateway: $gateway, server: $server, firewall: $firewall,
-        proxy: $proxy, proxyAddress: $proxyAddr, allowedPorts: $allowedPorts,
+        socks: $socks, http: $http, socksAddress: $socksAddr, httpAddress: $httpAddr,
         exitIp: $exitIp, viaVpn: $viaVpn}'
     return
   fi
@@ -378,13 +418,10 @@ cmd_status() {
   [[ $container == up ]] || { print "\nRun '$NAME up' to start."; return }
   print "login      ${login:-unknown}"
   print "vpn        ${vpn:-unknown}${gateway:+ — $gateway}"
-  print "exit       ${exit_ip:-unknown} $([[ $via_vpn == true ]] && print '(VPN gateway ✓)' || print '(NOT the VPN gateway ✗)')"
-  print "firewall   $([[ $firewall == true ]] && print "proxy limited to ports ${NDP_ALLOWED_PORTS} via VPN ✓" || print 'NOT loaded ✗')"
-  case $proxy in
-    up)          print "proxy      $PROXY answering, password required ✓" ;;
-    auth-failed) print "proxy      $PROXY rejected the Keychain password ✗" ;;
-    *)           print "proxy      $PROXY not answering ✗" ;;
-  esac
+  print "exit       ${exit_ip:-none} $([[ $via_vpn == true ]] && print '(VPN gateway ✓)' || print '(NOT through the VPN ✗)')"
+  print "kill sw.   $([[ $firewall == true ]] && print 'proxies reach the VPN only ✓' || print 'NOT loaded ✗')"
+  print "socks5     $SOCKS $([[ $socks == up ]] && print '✓' || print 'not answering ✗')"
+  print "http       $HTTP $([[ $http == up ]] && print '✓' || print 'not answering ✗')"
 }
 
 case "${1:-status}" in
@@ -397,9 +434,10 @@ case "${1:-status}" in
   logout)     cmd_logout ;;
   status)     shift 2>/dev/null; cmd_status "$@" ;;
   proxy-env)  cmd_proxy_env ;;
+  chrome)     cmd_chrome ;;
   gateways)   cmd_gateways ;;
   rebuild)    cmd_rebuild ;;
   logs)       docker logs -f $CONTAINER ;;
-  -h|--help|help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' ;;
   *)          die "unknown command '$1' (try: $NAME help)" ;;
 esac

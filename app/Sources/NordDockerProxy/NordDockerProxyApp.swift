@@ -55,10 +55,10 @@ struct TunnelMenu: View {
         Button("Refresh") { Task { await tunnel.refresh() } }
             .keyboardShortcut("r")
         if let s = tunnel.status, s.isUp {
-            Button("Copy Proxy Address (\(s.proxyAddress))") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString("socks5://\(s.proxyAddress)", forType: .string)
-            }
+            Button("Open Chrome via VPN") { tunnel.openChrome() }
+                .keyboardShortcut("o")
+            Button("Copy HTTP Proxy (\(s.httpAddress))") { copy("http://\(s.httpAddress)") }
+            Button("Copy SOCKS Proxy (\(s.socksAddress))") { copy("socks5h://\(s.socksAddress)") }
         }
         Button("Show Logs in Terminal") { runInTerminal("logs") }
         Toggle("Open at Login", isOn: Binding(
@@ -72,15 +72,14 @@ struct TunnelMenu: View {
     @ViewBuilder private var statusLines: some View {
         if let busy = tunnel.busy {
             Text(busy)
-            ForEach(tunnel.loginSteps, id: \.self) { Text("  \($0)") }
         }
         if let s = tunnel.status {
             Text(headline(s))
             if s.isUp {
                 Text(s.loggedIn ? "Login: \(account(s.login))" : "Login: not logged in")
-                Text("Exit \(s.exitIp.isEmpty ? "unknown" : s.exitIp) \(s.viaVpn ? "✓ VPN" : "✗ NOT via VPN")")
-                Text(s.firewall ? "Firewall: ports \(s.allowedPorts), VPN only ✓" : "Firewall: NOT loaded ✗")
-                Text(s.proxy == "up" ? "Proxy \(s.proxyAddress) ✓" : "Proxy \(s.proxyAddress) not answering ✗")
+                Text("Exit \(s.exitIp.isEmpty ? "none" : s.exitIp) \(s.viaVpn ? "✓ VPN" : "✗ NOT via VPN")")
+                Text(s.firewall ? "Kill switch: VPN only ✓" : "Kill switch: NOT loaded ✗")
+                Text("SOCKS \(s.socksAddress) \(s.socks == "up" ? "✓" : "✗")  ·  HTTP \(s.httpAddress) \(s.http == "up" ? "✓" : "✗")")
             }
         } else {
             Text("Checking…")
@@ -101,7 +100,7 @@ struct TunnelMenu: View {
                     Button("Connect VPN") { tunnel.connect() }.disabled(!idle)
                 }
             } else {
-                Button("Log In…") { tunnel.logIn() }.disabled(!idle)
+                Button("Log In in Terminal…") { runInTerminal("login") }.disabled(!idle)
             }
             Button("Stop (cut the link)") { tunnel.stop() }.disabled(!idle)
         } else {
@@ -115,9 +114,14 @@ struct TunnelMenu: View {
         case .off: return "Off — nothing reaches the VPN"
         case .needsLogin: return "Running — needs login"
         case .disconnected: return "Running — VPN disconnected"
-        case .degraded: return "Connected — proxy NOT healthy"
+        case .degraded: return "Connected — proxies NOT healthy"
         case .healthy: return "Connected — \(s.gateway)"
         }
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     /// "Logged in [me@x.com org]" → "me@x.com".

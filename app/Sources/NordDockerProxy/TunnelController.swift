@@ -12,7 +12,6 @@ final class TunnelController {
     private(set) var status: TunnelStatus?
     private(set) var lastError: String?
     private(set) var busy: String?          // non-nil while an action runs
-    private(set) var loginSteps: [String] = []
 
     private var pollTask: Task<Void, Never>?
 
@@ -75,22 +74,12 @@ final class TunnelController {
     func connect() { perform("Connecting…", ["connect"]) }
     func disconnect() { perform("Disconnecting…", ["disconnect"]) }
 
-    /// Runs `nord-docker-proxy login`, surfacing its `step:` lines in the menu as they
-    /// arrive. The CLI opens Chrome and finishes from the copied Continue link.
-    func logIn() {
-        guard busy == nil else { return }
-        busy = "Logging in…"
-        loginSteps = []
+    /// Opens the VPN Chrome profile. Quick and stateless, so it doesn't take
+    /// the busy slot; only a failure is reported.
+    func openChrome() {
         Task {
-            let result = await runCLI(["login"]) { line in
-                guard line.hasPrefix("step: ") else { return }
-                let step = String(line.dropFirst("step: ".count))
-                Task { @MainActor in self.loginSteps.append(step) }
-            }
-            if result.exitCode != 0 { lastError = Self.firstLine(result.stderr) ?? "login failed" }
-            busy = nil
-            loginSteps = []
-            await refresh()
+            let result = await runCLI(["chrome"])
+            if result.exitCode != 0 { lastError = Self.firstLine(result.stderr) ?? "could not open Chrome" }
         }
     }
 

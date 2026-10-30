@@ -1,5 +1,5 @@
-# NordLayer client + a SOCKS5 proxy. Only traffic sent to the proxy rides the
-# VPN; the Mac itself stays off it.
+# NordLayer client + SOCKS5 and HTTP proxies into it. Only traffic sent to the
+# proxies rides the VPN; the Mac itself stays off it.
 #
 # Pinned on purpose: the base image by digest, the NordLayer package by sha256.
 # NordLayer only publishes a "latest" URL, so a new release makes the build
@@ -12,7 +12,7 @@ ARG NORDLAYER_SHA256_arm64=00dbf8ea2ad455c1bfb5864a69434fa51e5c0dfa4b527f1162886
 ARG NORDLAYER_SHA256_amd64=037ff798826c3a453bd77b2ccd1e811c280a4205347a4a41a4f97791c3a3a9d2
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates curl iproute2 microsocks nftables \
+ && apt-get install -y --no-install-recommends ca-certificates curl iproute2 microsocks tinyproxy nftables \
  && curl -fsSL -o /tmp/nordlayer.deb \
       "https://downloads.nordlayer.com/linux/latest/debian/latest/nordlayer_latest_${TARGETARCH}.deb" \
  && eval "expected=\$NORDLAYER_SHA256_${TARGETARCH}" \
@@ -21,6 +21,7 @@ RUN apt-get update \
  && test -x /usr/sbin/nordlayerd \
  && rm -rf /tmp/nordlayer.deb /var/lib/apt/lists/*
 COPY entrypoint.sh /
+COPY tinyproxy.conf /etc/tinyproxy/ndp.conf
 RUN chmod 755 /entrypoint.sh
-EXPOSE 1080
+EXPOSE 1080 8080
 ENTRYPOINT ["/entrypoint.sh"]

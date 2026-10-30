@@ -10,17 +10,18 @@ struct TunnelStatus: Decodable, Equatable, Sendable {
     var gateway: String
     var server: String
     var firewall: Bool
-    var proxy: String
-    var proxyAddress: String
-    var allowedPorts: String
+    var socks: String
+    var http: String
+    var socksAddress: String
+    var httpAddress: String
     var exitIp: String
     var viaVpn: Bool
 
     var isUp: Bool { container == "up" }
 
-    /// The single state the menu bar icon reports. Healthy means the proxy
-    /// answers, its traffic exits at the VPN gateway, and the proxy firewall
-    /// (VPN-only, allowed ports only) is loaded; anything less is not.
+    /// The single state the menu bar icon reports. Healthy means both proxies
+    /// answer, their traffic exits at the VPN gateway, and the proxies'
+    /// tunnel-only rule is loaded; anything less is not.
     enum Health { case notConfigured, off, needsLogin, disconnected, degraded, healthy }
 
     var health: Health {
@@ -28,6 +29,6 @@ struct TunnelStatus: Decodable, Equatable, Sendable {
         guard isUp else { return .off }
         guard loggedIn else { return .needsLogin }
         guard connected else { return .disconnected }
-        return proxy == "up" && viaVpn && firewall ? .healthy : .degraded
+        return socks == "up" && http == "up" && viaVpn && firewall ? .healthy : .degraded
     }
 }
