@@ -1,0 +1,40 @@
+# Every setting lives here. Values come from your config file
+# (~/.config/nord-docker-proxy/config.env, written by `nord-docker-proxy setup`),
+# which the CLI passes to compose with --env-file.
+services:
+  nordlayer:
+    build: ./docker
+    image: nord-docker-proxy
+    container_name: nord-docker-proxy
+    init: true
+    cap_add: [NET_ADMIN, IPC_LOCK]
+    devices: [/dev/net/tun]
+    environment:
+      # Destination ports the proxy may reach, through the VPN only.
+      # Comma-separated (e.g. "27017" or "5432,6379"), or "any". Required:
+      # an unset value refuses to start rather than opening the whole VPN.
+      ALLOWED_PORTS: ${NDP_ALLOWED_PORTS:?set NDP_ALLOWED_PORTS (run nord-docker-proxy setup)}
+      # Auto-stop after N hours of uptime; 0 = never.
+      MAX_HOURS: ${NDP_MAX_HOURS:-0}
+      # Proxy credentials, supplied by the CLI from the macOS Keychain.
+      PROXY_USER: ${NDP_PROXY_USER:?}
+      PROXY_PASS: ${NDP_PROXY_PASS:?}
+    volumes:
+      # NordLayer login token + device identity. Survives `down`; `logout` removes it.
+      - state:/var/lib/nordlayer
+    ports:
+      # Loopback only: nothing else on the network can reach the proxy.
+      - "127.0.0.1:${NDP_PROXY_PORT:-1080}:1080"
+    # Down means down: never comes back on its own.
+    restart: "no"
+
+volumes:
+  state:
+    name: ${NDP_STATE_VOLUME:-nord-docker-proxy-state}
+    # Created by the CLI and never removed by `down`.
+    external: true
+
+# Read by the CLI only (compose ignores them), listed so every setting is in one place:
+#   NDP_ORG       NordLayer organization ID                     (required)
+#   NDP_GATEWAY   gateway ID to connect to (`nordlayer gateways`) (required)
+#   NDP_ACCOUNT   the only NordLayer email accepted at login    (optional)

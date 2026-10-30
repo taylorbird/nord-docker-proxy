@@ -1,0 +1,405 @@
+#!/bin/zsh -f
+# nord-docker-proxy — the NordLayer VPN in a Docker container, exposed to this
+# Mac only as a password-protected SOCKS5 proxy on 127.0.0.1. Only traffic sent
+# to the proxy rides the VPN, and only to the ports you allow; the Mac itself
+# stays off the VPN. `down` severs the link entirely.
+#
+#   nord-docker-proxy setup               first-run: org, ports, login, gateway
+#   nord-docker-proxy up [--hours N]      start; connect if logged in; optional auto-stop
+#   nord-docker-proxy down                stop and remove the container (login is kept)
+#   nord-docker-proxy connect             connect the VPN to the configured gateway
+#   nord-docker-proxy disconnect          drop the VPN, leave the container running
+#   nord-docker-proxy login               log in (SSO); finishes itself from the clipboard
+#   nord-docker-proxy logout              end the session and delete the saved login
+#   nord-docker-proxy status [--json]     container / login / VPN exit / firewall / proxy
+#   nord-docker-proxy proxy-env           `export` lines for scripts: eval "$(nord-docker-proxy proxy-env)"
+#   nord-docker-proxy gateways            list the gateways your account can use
+#   nord-docker-proxy rebuild             rebuild the image (after updating the pinned package)
+#   nord-docker-proxy logs                follow the container's logs
+#
+# Settings: ~/.config/nord-docker-proxy/config.env (compose env-file format);
+# every setting is documented in compose.yaml.
+
+set -u
+PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:/Applications/Docker.app/Contents/Resources/bin
+
+NAME=nord-docker-proxy
+ROOT=${0:A:h:h}
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/$NAME
+CONFIG=$CONFIG_DIR/config.env
+CONTAINER=$NAME
+IMAGE=$NAME
+PROXY_USER=$NAME
+KEYCHAIN_SERVICE=$NAME
+LOGIN_TIMEOUT=300
+
+die() { print -u2 -r -- "$NAME: $*"; exit 1 }
+
+# The config is compose's env-file format. Read as data (KEY=value lines),
+# never sourced, so a stray line can't run as code.
+load_config() {
+  local line
+  [[ -f "$CONFIG" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ '^(NDP_[A-Z_]+)=(.*)$' ]] && typeset -g "${match[1]}=${match[2]}"
+  done < "$CONFIG"
+}
+load_config
+STATE_VOLUME=${NDP_STATE_VOLUME:-$NAME-state}
+PROXY_PORT=${NDP_PROXY_PORT:-1080}
+PROXY=127.0.0.1:$PROXY_PORT
+
+set_config() {   # set_config KEY value — add or replace one line
+  mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
+  touch "$CONFIG"; chmod 600 "$CONFIG"
+  local tmp; tmp=$(mktemp "$CONFIG_DIR/.config.XXXXXX")
+  grep -v "^$1=" "$CONFIG" > "$tmp" 2>/dev/null
+  print -r -- "$1=$2" >> "$tmp"
+  mv "$tmp" "$CONFIG"
+  typeset -g "$1=$2"
+}
+
+require_config() {
+  [[ -n "${NDP_ORG:-}" && -n "${NDP_ALLOWED_PORTS:-}" ]] || die "not set up yet; run: $NAME setup"
+}
+
+# The proxy password lives in the login Keychain, generated on first use. It
+# is never printed except by `proxy-env`, which exists to be eval'd.
+proxy_pass() {
+  local p
+  p=$(security find-generic-password -s $KEYCHAIN_SERVICE -a $PROXY_USER -w 2>/dev/null)
+  if [[ -z "$p" ]]; then
+    p=$(openssl rand -hex 24)
+    security add-generic-password -s $KEYCHAIN_SERVICE -a $PROXY_USER -w "$p" \
+      -D "$NAME SOCKS proxy password" >/dev/null || die "could not store the proxy password in Keychain"
+  fi
+  print -r -- "$p"
+}
+
+# Every compose call gets the config file plus the Keychain-held credentials.
+compose() {
+  local envfile=(); [[ -f "$CONFIG" ]] && envfile=(--env-file "$CONFIG")
+  NDP_PROXY_USER=$PROXY_USER NDP_PROXY_PASS=$(proxy_pass) NDP_MAX_HOURS=${NDP_MAX_HOURS:-0} \
+    docker compose --progress quiet -p $NAME $envfile -f "$ROOT/compose.yaml" "$@"
+}
+running() { [[ "$(docker inspect -f '{{.State.Running}}' $CONTAINER 2>/dev/null)" == true ]] }
+nl() { docker exec -u nordlayer $CONTAINER nordlayer --silent "$@" }
+field() { print -r -- "$1" | sed -n "s/^$2: //p" | head -1 }
+logged_in_now() { [[ "$(field "$(nl status)" Login)" == "Logged in"* ]] }
+
+# The daemon's socket appears a moment after the container starts. Checked by
+# file, not by `nordlayer status`, which exits 0 even when it cannot connect.
+wait_for_daemon() {
+  local i
+  for i in {1..30}; do
+    docker exec $CONTAINER test -S /run/nordlayer/nordlayer.sock 2>/dev/null && return 0
+    sleep 0.5
+  done
+  die "NordLayer daemon did not come up; see '$NAME logs'"
+}
+
+# Builds only when the image is missing, so `up` never quietly pulls a new
+# NordLayer release; `rebuild` is the deliberate path.
+start_container() {
+  require_config
+  docker info >/dev/null 2>&1 || die "Docker is not running"
+  docker volume inspect $STATE_VOLUME >/dev/null 2>&1 || docker volume create $STATE_VOLUME >/dev/null
+  docker image inspect $IMAGE >/dev/null 2>&1 || compose build >/dev/null || die "image build failed (pinned package changed? see docker/Dockerfile)"
+  compose up -d >/dev/null || die "could not start the container"
+}
+
+cmd_up() {
+  if [[ "${1:-}" == --hours ]]; then
+    [[ "${2:-}" == <-> ]] || die "--hours needs a whole number"
+    NDP_MAX_HOURS=$2
+  fi
+  running || start_container
+  wait_for_daemon
+  if logged_in_now; then
+    cmd_connect
+  else
+    print "Container is up but NordLayer is not logged in. Run: $NAME login"
+  fi
+  (( ${NDP_MAX_HOURS:-0} > 0 )) && print "Stops itself after ${NDP_MAX_HOURS}h."
+  return 0
+}
+
+cmd_down() {
+  compose down >/dev/null 2>&1
+  running && die "container is still running"
+  print "Down. The proxy is gone; nothing reaches the VPN."
+}
+
+cmd_connect() {
+  running || die "not running; run '$NAME up'"
+  [[ -n "${NDP_GATEWAY:-}" ]] || die "no gateway configured; run '$NAME setup' or set NDP_GATEWAY"
+  nl connect "$NDP_GATEWAY" >/dev/null || die "connect failed; see '$NAME status'"
+  print "Connected to gateway $NDP_GATEWAY."
+}
+
+cmd_disconnect() {
+  running || die "not running"
+  nl disconnect >/dev/null || die "disconnect failed"
+  print "Disconnected. The container is still up; '$NAME down' to remove it."
+}
+
+# Ends the NordLayer session server-side, then removes the volume holding the
+# token and device identity. The next `up` starts from a fresh login.
+cmd_logout() {
+  if running; then
+    nl disconnect >/dev/null 2>&1
+    nl logout >/dev/null 2>&1 || print -u2 "$NAME: NordLayer logout failed; removing the saved login anyway"
+  fi
+  compose down >/dev/null 2>&1
+  docker volume rm $STATE_VOLUME >/dev/null 2>&1
+  docker volume inspect $STATE_VOLUME >/dev/null 2>&1 && die "could not remove the $STATE_VOLUME volume"
+  print "Logged out. Saved login deleted; '$NAME login' to start over."
+}
+
+cmd_rebuild() {
+  require_config
+  compose build --no-cache >/dev/null || die "image build failed (pinned package changed? see docker/Dockerfile)"
+  print "Rebuilt. Run '$NAME down' then '$NAME up' to use it."
+}
+
+cmd_proxy_env() {
+  local pass; pass=$(proxy_pass)
+  print -r -- "export NDP_PROXY_HOST=127.0.0.1 NDP_PROXY_PORT=$PROXY_PORT"
+  print -r -- "export NDP_PROXY_USER=$PROXY_USER NDP_PROXY_PASS=$pass"
+  print -r -- "export NDP_PROXY_URL=socks5h://$PROXY_USER:$pass@$PROXY"
+}
+
+# `nordlayer gateways` prints a table whose IDs contain zero-width spaces;
+# this yields clean "id<TAB>name" lines.
+gateway_rows() {
+  nl gateways 2>/dev/null | sed $'s/\u200b//g' \
+    | awk -F'│' 'NF >= 3 { n=$1; i=$2; gsub(/^ +| +$/, "", n); gsub(/^ +| +$/, "", i);
+                 if (i != "" && i != "ID" && n !~ /Name\/Country/) print i "\t" n }'
+}
+
+cmd_gateways() {
+  running || die "not running; run '$NAME up'"
+  logged_in_now || die "not logged in; run '$NAME login'"
+  gateway_rows | awk -F'\t' '{ printf "%-16s %s\n", $1, $2 }'
+}
+
+# Interactive first run. Each answer lands in the config file, so re-running
+# setup only changes what you answer differently.
+cmd_setup() {
+  [[ -t 0 ]] || die "setup is interactive; run it in a terminal"
+  local answer
+  print "nord-docker-proxy setup — answers are saved to $CONFIG"
+  print
+  read "answer?NordLayer organization ID [${NDP_ORG:-}]: "
+  [[ -n "$answer" ]] && set_config NDP_ORG "$answer"
+  [[ -n "${NDP_ORG:-}" ]] || die "an organization ID is required"
+
+  print "\nWhich destination ports may the proxy reach through the VPN?"
+  print "Comma-separated (e.g. 27017 for MongoDB, 5432 for Postgres), or 'any'."
+  read "answer?Allowed ports [${NDP_ALLOWED_PORTS:-}]: "
+  [[ -n "$answer" ]] && set_config NDP_ALLOWED_PORTS "$answer"
+  [[ "${NDP_ALLOWED_PORTS:-}" == any || "${NDP_ALLOWED_PORTS:-}" =~ '^[0-9]+(,[0-9]+)*$' ]] \
+    || die "allowed ports must look like 27017 or 5432,6379 or any"
+
+  read "answer?Only accept this NordLayer login email (optional) [${NDP_ACCOUNT:-}]: "
+  [[ -n "$answer" ]] && set_config NDP_ACCOUNT "$answer"
+
+  print
+  running || start_container
+  wait_for_daemon
+  logged_in_now || cmd_login_inner
+
+  print "\nGateways available to you:"
+  local -a rows; rows=("${(@f)$(gateway_rows)}")
+  (( ${#rows} )) && [[ -n "${rows[1]}" ]] || die "no gateways listed for this account"
+  local i
+  for i in {1..${#rows}}; do print "  $i) ${rows[$i]#*$'\t'}  (${rows[$i]%%$'\t'*})"; done
+  read "answer?Connect to which? [1]: "
+  answer=${answer:-1}
+  [[ "$answer" == <-> ]] && (( answer >= 1 && answer <= ${#rows} )) || die "pick a number from the list"
+  set_config NDP_GATEWAY "${rows[$answer]%%$'\t'*}"
+
+  cmd_connect
+  print "\nDone. '$NAME status' to check; '$NAME down' to stop."
+}
+
+# NordLayer's SSO ends by sending the browser to nordlayer://auth?exchange_token=…
+# On a Mac that link belongs to the NordLayer app (if installed) or nothing, so
+# the container never sees it. Instead: right-click "Continue" on the success
+# page → Copy Link. A background watcher spots the link on the clipboard, hands
+# it to the container's `nordlayer click` (what Linux's own URL handler runs),
+# then clears the clipboard.
+#
+# The login prompt wants a TTY (it asks which method to use), so expect drives
+# it: picks an SSO method, opens the sign-in URL in the browser. That makes the
+# flow non-interactive, so the menu bar app runs this same command. Progress
+# goes to stdout as `step: …` lines the app shows as-is.
+cmd_login() {
+  running || start_container
+  wait_for_daemon
+  if logged_in_now; then
+    print "step: already logged in"
+    [[ -n "${NDP_GATEWAY:-}" ]] && cmd_connect
+    return 0
+  fi
+  cmd_login_inner
+  [[ -n "${NDP_GATEWAY:-}" ]] && cmd_connect
+  return 0
+}
+
+cmd_login_inner() {
+  require_config
+  print "step: opening sign-in in the browser"
+  print "step: on the success page, right-click \"Continue\" → Copy Link"
+  {
+    local deadline=$(( SECONDS + LOGIN_TIMEOUT )) clip
+    while (( SECONDS < deadline )); do
+      clip=$(pbpaste 2>/dev/null)
+      if [[ "$clip" == nordlayer://auth\?exchange_token=* ]]; then
+        # Handed over on stdin, never as an argument on this Mac, so the token
+        # never shows in the Mac-wide process list.
+        print -r -- "$clip" | docker exec -i -u nordlayer $CONTAINER \
+          sh -c 'nordlayer --silent click "$(cat)"' >/dev/null 2>&1
+        pbcopy </dev/null
+        exit 0
+      fi
+      sleep 1
+    done
+  } &!
+  local watcher=$!
+  # The watcher is disowned so it survives the expect session; it must not
+  # survive us. Ctrl-C, an error, or normal exit all stop it.
+  trap "kill $watcher 2>/dev/null" EXIT INT TERM
+  NDP_C=$CONTAINER NDP_O=$NDP_ORG NDP_T=$LOGIN_TIMEOUT expect -f - <<'EXPECT'
+log_user 0
+set timeout 30
+spawn docker exec -it -u nordlayer $env(NDP_C) nordlayer login -o $env(NDP_O)
+# Prefer an SSO method in this order; email/password needs typing, so it's
+# left to `docker exec -it … nordlayer login` by hand.
+set methods [dict create]
+expect {
+  -re {(\d+): ([^\r\n]+)} {
+    dict set methods [string trim [string tolower $expect_out(2,string)]] $expect_out(1,string)
+    exp_continue
+  }
+  -re {Select \[number\]:} {
+    set choice ""
+    foreach m {google okta "entra id" azure onelogin jumpcloud} {
+      dict for {name num} $methods { if {$choice eq "" && [string first $m $name] >= 0} { set choice $num } }
+    }
+    if {$choice eq ""} { puts "step: no SSO method offered; log in by hand"; exit 1 }
+    send "$choice\r"
+  }
+  -re {already logged in} { exit 0 }
+  timeout { puts "step: NordLayer did not prompt for a login method"; exit 1 }
+  eof     { puts "step: login ended unexpectedly"; exit 1 }
+}
+expect {
+  -re {(https://\S+)} {
+    exec open $expect_out(1,string)
+    puts "step: waiting for the copied Continue link"
+  }
+  timeout { puts "step: no sign-in link was printed"; exit 1 }
+}
+set timeout $env(NDP_T)
+expect {
+  eof     { exit 0 }
+  timeout { puts "step: timed out waiting for sign-in"; exit 1 }
+}
+EXPECT
+  kill $watcher 2>/dev/null
+  logged_in_now || die "login did not complete"
+  verify_account
+  print "step: logged in"
+}
+
+# Anything that can write the clipboard during the login window could hand
+# over its OWN exchange token, logging the container into someone else's
+# NordLayer org — and routing the proxy through their gateway. So the account
+# that logged in must be in the configured org (and be NDP_ACCOUNT, when set);
+# otherwise log straight back out and delete the saved login.
+verify_account() {
+  local who; who=$(field "$(nl status)" Login)   # Logged in [email org]
+  local email=${${who#*\[}%% *} org=${${who%\]}##* }
+  if [[ "$org" != "$NDP_ORG" || ( -n "${NDP_ACCOUNT:-}" && "$email" != "$NDP_ACCOUNT" ) ]]; then
+    nl logout >/dev/null 2>&1
+    compose down >/dev/null 2>&1
+    docker volume rm $STATE_VOLUME >/dev/null 2>&1
+    die "logged in as an unexpected account ($email, org $org) — logged out and removed it. Do not reuse that link."
+  fi
+}
+
+# One snapshot of every layer.
+#  - firewall: the proxy's VPN-only / allowed-ports rules are loaded.
+#  - exit IP: probed from inside the container as root (the proxy itself may
+#    not reach port 443), via the same routing the proxy's traffic uses.
+#  - proxy: an authenticated SOCKS handshake from the Mac succeeds. The target
+#    is the container's own closed port, so the handshake completes and the
+#    connect is refused: "refused" proves auth worked, "rejected" means the
+#    password is wrong, anything else means the proxy isn't answering.
+collect() {
+  configured=false; [[ -n "${NDP_ORG:-}" && -n "${NDP_ALLOWED_PORTS:-}" ]] && configured=true
+  container=down login="" vpn="" gateway="" server="" firewall=false proxy=down exit_ip=""
+  if running; then
+    container=up
+    local s err
+    s=$(nl status 2>/dev/null)
+    login=$(field "$s" Login); vpn=$(field "$s" VPN)
+    gateway=$(field "$s" Gateway); server=$(field "$s" "Server address")
+    docker exec $CONTAINER nft list table inet proxy_firewall >/dev/null 2>&1 && firewall=true
+    exit_ip=$(docker exec $CONTAINER curl -s -m 6 https://api.ipify.org 2>/dev/null)
+    err=$(curl -sS -m 6 --proxy "socks5h://$PROXY_USER:$(proxy_pass)@$PROXY" telnet://127.0.0.1:9 </dev/null 2>&1 >/dev/null)
+    case "$err" in
+      *"Can't complete SOCKS5 connection"*|*"Connection refused"*|"") proxy=up ;;
+      *rejected*|*"authentication"*|*"acceptable"*) proxy=auth-failed ;;
+    esac
+  fi
+  logged_in=false; [[ "$login" == "Logged in"* ]] && logged_in=true
+  connected=false; [[ "$vpn" == Connected ]] && connected=true
+  # Through the VPN only when the container exits at the gateway's address.
+  via_vpn=false; [[ -n "$exit_ip" && "$exit_ip" == "$server" ]] && via_vpn=true
+}
+
+cmd_status() {
+  collect
+  if [[ "${1:-}" == --json ]]; then
+    jq -n --argjson configured $configured --arg container "$container" --argjson loggedIn $logged_in \
+      --arg login "$login" --argjson connected $connected --arg gateway "$gateway" --arg server "$server" \
+      --argjson firewall $firewall --arg proxy "$proxy" --arg exitIp "$exit_ip" \
+      --argjson viaVpn $via_vpn --arg proxyAddr $PROXY --arg allowedPorts "${NDP_ALLOWED_PORTS:-}" \
+      '{configured: $configured, container: $container, loggedIn: $loggedIn, login: $login,
+        connected: $connected, gateway: $gateway, server: $server, firewall: $firewall,
+        proxy: $proxy, proxyAddress: $proxyAddr, allowedPorts: $allowedPorts,
+        exitIp: $exitIp, viaVpn: $viaVpn}'
+    return
+  fi
+  [[ $configured == true ]] || { print "Not set up yet. Run: $NAME setup"; return }
+  print "container  $container"
+  [[ $container == up ]] || { print "\nRun '$NAME up' to start."; return }
+  print "login      ${login:-unknown}"
+  print "vpn        ${vpn:-unknown}${gateway:+ — $gateway}"
+  print "exit       ${exit_ip:-unknown} $([[ $via_vpn == true ]] && print '(VPN gateway ✓)' || print '(NOT the VPN gateway ✗)')"
+  print "firewall   $([[ $firewall == true ]] && print "proxy limited to ports ${NDP_ALLOWED_PORTS} via VPN ✓" || print 'NOT loaded ✗')"
+  case $proxy in
+    up)          print "proxy      $PROXY answering, password required ✓" ;;
+    auth-failed) print "proxy      $PROXY rejected the Keychain password ✗" ;;
+    *)           print "proxy      $PROXY not answering ✗" ;;
+  esac
+}
+
+case "${1:-status}" in
+  setup)      cmd_setup ;;
+  up)         shift; cmd_up "$@" ;;
+  down)       cmd_down ;;
+  connect)    cmd_connect ;;
+  disconnect) cmd_disconnect ;;
+  login)      cmd_login ;;
+  logout)     cmd_logout ;;
+  status)     shift 2>/dev/null; cmd_status "$@" ;;
+  proxy-env)  cmd_proxy_env ;;
+  gateways)   cmd_gateways ;;
+  rebuild)    cmd_rebuild ;;
+  logs)       docker logs -f $CONTAINER ;;
+  -h|--help|help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)          die "unknown command '$1' (try: $NAME help)" ;;
+esac
