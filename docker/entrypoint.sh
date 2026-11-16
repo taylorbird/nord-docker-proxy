@@ -10,7 +10,7 @@
 set -euo pipefail
 
 # /run/nordlayer is runtime state only. A container that was killed rather than
-# stopped (Docker/OrbStack dying, a Mac sleep) keeps its old socket when it is
+# stopped (e.g. Docker/OrbStack dying under it) keeps its old socket when it is
 # restarted, and nordlayerd then refuses to start ("bind: address already in
 # use"). Start every boot from an empty directory.
 rm -rf /run/nordlayer
