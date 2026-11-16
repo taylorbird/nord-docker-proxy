@@ -3,7 +3,12 @@
 # which the CLI passes to compose with --env-file.
 services:
   nordlayer:
-    build: ./docker
+    build:
+      context: ./docker
+      # Fingerprint of the files the image was built from, set by the CLI.
+      # Lets it spot an image (or container) older than the installed version.
+      labels:
+        ndp.recipe: ${NDP_RECIPE:-}
     image: nord-docker-proxy
     container_name: nord-docker-proxy
     init: true

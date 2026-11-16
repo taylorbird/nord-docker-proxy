@@ -65,10 +65,23 @@ require_config() {
 # Every compose call gets the config file.
 compose() {
   local envfile=(); [[ -f "$CONFIG" ]] && envfile=(--env-file "$CONFIG")
-  NDP_MAX_HOURS=${NDP_MAX_HOURS:-0} \
+  NDP_MAX_HOURS=${NDP_MAX_HOURS:-0} NDP_RECIPE=$(recipe) \
     docker compose --progress quiet -p $NAME $envfile -f "$ROOT/compose.yaml" "$@"
 }
 running() { [[ "$(docker inspect -f '{{.State.Running}}' $CONTAINER 2>/dev/null)" == true ]] }
+
+# Fingerprint of the files the image is built from. An upgrade that changes
+# them leaves the old image in place (`up` only builds a missing one), so the
+# image carries the fingerprint it was built from as a label to compare against.
+recipe() { cat "$ROOT"/docker/{Dockerfile,entrypoint.sh,tinyproxy.conf} | shasum -a 256 | cut -c1-12 }
+# Image built from the files this CLI ships (pre-label images count as old).
+image_current() {
+  [[ "$(docker image inspect -f '{{index .Config.Labels "ndp.recipe"}}' $IMAGE 2>/dev/null)" == "$(recipe)" ]]
+}
+# Container created from the current image (a rebuild doesn't touch a running one).
+container_current() {
+  [[ "$(docker inspect -f '{{.Image}}' $CONTAINER 2>/dev/null)" == "$(docker image inspect -f '{{.Id}}' $IMAGE 2>/dev/null)" ]]
+}
 nl() { docker exec -u nordlayer $CONTAINER nordlayer --silent "$@" }
 field() { print -r -- "$1" | sed -n "s/^$2: //p" | head -1 }
 logged_in_now() { [[ "$(field "$(nl status)" Login)" == "Logged in"* ]] }
@@ -113,6 +126,11 @@ cmd_up() {
     print "Container is up but NordLayer is not logged in. Run: $NAME login"
   fi
   (( ${NDP_MAX_HOURS:-0} > 0 )) && print "Stops itself after ${NDP_MAX_HOURS}h."
+  if ! image_current; then
+    print "Note: the image is older than this version of $NAME. Update it: $NAME rebuild, then down and up."
+  elif ! container_current; then
+    print "Note: the container runs an older image. Switch to the new one: $NAME down, then up."
+  fi
   return 0
 }
 
@@ -390,6 +408,15 @@ collect() {
   # A stuck Docker engine (e.g. OrbStack hung at "Starting") looks like a
   # stopped container; tell them apart so the fix is obvious.
   docker info >/dev/null 2>&1 || container=no-docker
+  # image: current | outdated (built from older files) | stale-container
+  # (image current, but the running container predates it) | missing
+  image=missing
+  if [[ $container != no-docker ]] && docker image inspect $IMAGE >/dev/null 2>&1; then
+    if ! image_current; then image=outdated
+    elif running && ! container_current; then image=stale-container
+    else image=current
+    fi
+  fi
   if [[ $container != no-docker ]] && running; then
     container=up
     local s err code
@@ -415,8 +442,8 @@ cmd_status() {
     jq -n --argjson configured $configured --arg container "$container" --argjson loggedIn $logged_in \
       --arg login "$login" --argjson connected $connected --arg gateway "$gateway" --arg server "$server" \
       --argjson firewall $firewall --arg socks "$socks" --arg http "$http" --arg exitIp "$exit_ip" \
-      --argjson viaVpn $via_vpn --arg socksAddr $SOCKS --arg httpAddr $HTTP \
-      '{configured: $configured, container: $container, loggedIn: $loggedIn, login: $login,
+      --argjson viaVpn $via_vpn --arg socksAddr $SOCKS --arg httpAddr $HTTP --arg image "$image" \
+      '{configured: $configured, container: $container, image: $image, loggedIn: $loggedIn, login: $login,
         connected: $connected, gateway: $gateway, server: $server, firewall: $firewall,
         socks: $socks, http: $http, socksAddress: $socksAddr, httpAddress: $httpAddr,
         exitIp: $exitIp, viaVpn: $viaVpn}'
@@ -429,6 +456,11 @@ cmd_status() {
     return
   fi
   print "container  $container"
+  case $image in
+    current)         print "image      current ✓" ;;
+    outdated)        print "image      older than this version ✗ — '$NAME rebuild', then down and up" ;;
+    stale-container) print "image      container runs an older image ✗ — '$NAME down', then up" ;;
+  esac
   [[ $container == up ]] || { print "\nRun '$NAME up' to start."; return }
   print "login      ${login:-unknown}"
   print "vpn        ${vpn:-unknown}${gateway:+ — $gateway}"
