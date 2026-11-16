@@ -73,12 +73,15 @@ nl() { docker exec -u nordlayer $CONTAINER nordlayer --silent "$@" }
 field() { print -r -- "$1" | sed -n "s/^$2: //p" | head -1 }
 logged_in_now() { [[ "$(field "$(nl status)" Login)" == "Logged in"* ]] }
 
-# The daemon's socket appears a moment after the container starts. Checked by
-# file, not by `nordlayer status`, which exits 0 even when it cannot connect.
+# The daemon answers a moment after the container starts. Checked by its
+# answer, not by the socket file (a stale one can outlive the daemon) nor by
+# `nordlayer status`'s exit code (0 even when it cannot connect). If the
+# container dies meanwhile, say so instead of waiting it out.
 wait_for_daemon() {
   local i
   for i in {1..30}; do
-    docker exec $CONTAINER test -S /run/nordlayer/nordlayer.sock 2>/dev/null && return 0
+    running || die "the container exited while starting; see '$NAME logs'"
+    [[ -n "$(field "$(nl status 2>/dev/null)" Login)" ]] && return 0
     sleep 0.5
   done
   die "NordLayer daemon did not come up; see '$NAME logs'"
@@ -91,7 +94,10 @@ start_container() {
   docker info >/dev/null 2>&1 || die "Docker is not running"
   docker volume inspect $STATE_VOLUME >/dev/null 2>&1 || docker volume create $STATE_VOLUME >/dev/null
   docker image inspect $IMAGE >/dev/null 2>&1 || compose build >/dev/null || die "image build failed (pinned package changed? see docker/Dockerfile)"
-  compose up -d >/dev/null || die "could not start the container"
+  # Only reached when the container isn't running. Recreate instead of
+  # restarting a stopped one, so nothing from a killed run carries over (the
+  # login lives on the volume, which is kept).
+  compose up -d --force-recreate >/dev/null || die "could not start the container"
 }
 
 cmd_up() {
@@ -381,7 +387,10 @@ verify_account() {
 collect() {
   configured=false; [[ -n "${NDP_ORG:-}" ]] && configured=true
   container=down login="" vpn="" gateway="" server="" firewall=false socks=down http=down exit_ip=""
-  if running; then
+  # A stuck Docker engine (e.g. OrbStack hung at "Starting") looks like a
+  # stopped container; tell them apart so the fix is obvious.
+  docker info >/dev/null 2>&1 || container=no-docker
+  if [[ $container != no-docker ]] && running; then
     container=up
     local s err code
     s=$(nl status 2>/dev/null)
@@ -414,6 +423,11 @@ cmd_status() {
     return
   fi
   [[ $configured == true ]] || { print "Not set up yet. Run: $NAME setup"; return }
+  if [[ $container == no-docker ]]; then
+    print "docker     not responding ✗"
+    print "\nDocker isn't answering. Restart it (OrbStack: 'orb stop' then 'orb start'), then '$NAME up'."
+    return
+  fi
   print "container  $container"
   [[ $container == up ]] || { print "\nRun '$NAME up' to start."; return }
   print "login      ${login:-unknown}"
