@@ -9,6 +9,11 @@
 # goes through the tunnel or nowhere.
 set -euo pipefail
 
+# /run/nordlayer is runtime state only. A container that was killed rather than
+# stopped (e.g. Docker/OrbStack dying under it) keeps its old socket when it is
+# restarted, and nordlayerd then refuses to start ("bind: address already in
+# use"). Start every boot from an empty directory.
+rm -rf /run/nordlayer
 mkdir -p /run/nordlayer /var/lib/nordlayer
 # Recursive: the saved login on the volume outlives the image, and a rebuild can
 # give the `nordlayer` user a different UID (e.g. when another package's system
